@@ -26,14 +26,18 @@ def save_traj(
     timestamps,
     frames: SharedKeyframes,
     intrinsics: Optional[Intrinsics] = None,
+    start_idx: int = 0,
 ):
     # log
     logdir = pathlib.Path(logdir)
     logdir.mkdir(exist_ok=True, parents=True)
     logfile = logdir / logfile
     with open(logfile, "w") as f:
-        # for keyframe_id in frames.keyframe_ids:
-        for i in range(len(frames)):
+        # [map_relocalize] only save new poses (skip prebuilt keyframes)
+        start_idx = start_idx if config.get("map_relocalize", False) else 0
+        print(f"[trajectory] Saving poses for new keyframes from index {start_idx} to {len(frames)-1}")
+
+        for i in range(start_idx, len(frames)):
             keyframe = frames[i]
             t = timestamps[keyframe.frame_id]
             if intrinsics is None:
@@ -68,6 +72,41 @@ def save_reconstruction(savedir, filename, keyframes, c_conf_threshold):
     colors = np.concatenate(colors, axis=0)
 
     save_ply(savedir / filename, pointclouds, colors)
+
+
+def save_relocalize_reconstruction(savedir, filename, keyframes, c_conf_threshold, start_idx=0):
+    # [map_relocalize] save the reconstruction with the loaded scene
+    # loaded kf start from index 0 to start_idx-1
+    savedir = pathlib.Path(savedir)
+    savedir.mkdir(exist_ok=True, parents=True)
+    pointclouds = []
+    colors = []
+
+    print(f"[relocalize] Saving reconstruction with {len(keyframes)} total keyframes (including prebuilt scene)")
+    print(f"[relocalize] Prebuilt keyframes: 0 to {start_idx-1}, New keyframes: {start_idx} to {len(keyframes)-1}")
+
+    # Add all keyframes (both prebuilt and new)
+    for i in range(len(keyframes)):
+        keyframe = keyframes[i]
+        if config["use_calib"]:
+            X_canon = constrain_points_to_ray(
+                keyframe.img_shape.flatten()[:2], keyframe.X_canon[None], keyframe.K
+            )
+            keyframe.X_canon = X_canon.squeeze(0)
+        pW = keyframe.T_WC.act(keyframe.X_canon).cpu().numpy().reshape(-1, 3)
+        color = (keyframe.uimg.cpu().numpy() * 255).astype(np.uint8).reshape(-1, 3)
+        valid = (
+            keyframe.get_average_conf().cpu().numpy().astype(np.float32).reshape(-1)
+            > c_conf_threshold
+        )
+        pointclouds.append(pW[valid])
+        colors.append(color[valid])
+
+    if len(pointclouds) > 0:
+        pointclouds = np.concatenate(pointclouds, axis=0)
+        colors = np.concatenate(colors, axis=0)
+        save_ply(savedir / filename, pointclouds, colors)
+        print(f"[localization] Saved {len(pointclouds)} points to {savedir / filename}")
 
 
 def save_keyframes(savedir, timestamps, keyframes: SharedKeyframes):

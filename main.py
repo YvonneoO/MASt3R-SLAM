@@ -23,7 +23,8 @@ from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
 from mast3r_slam.tracker import FrameTracker
 from mast3r_slam.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
-
+import numpy as np
+import os, re, glob
 
 def relocalization(frame, keyframes, factor_graph, retrieval_database):
     # we are adding and then removing from the keyframe, so we need to be careful.
@@ -77,6 +78,17 @@ def run_backend(cfg, model, states, keyframes, K):
     device = keyframes.device
     factor_graph = FactorGraph(model, keyframes, K, device)
     retrieval_database = load_retriever(model)
+
+    # [map_relocalize]: index the loaded keyframes into the retrieval database
+    if len(keyframes) > 0:
+        for idx in range(len(keyframes)):
+            retrieval_database.update(
+                keyframes[idx],
+                add_after_query=True,
+                k=config["retrieval"]["k"],
+                min_thresh=config["retrieval"]["min_thresh"],
+            )
+        print(f"[backend] retrieval DB primed with {len(keyframes)} prebuilt keyframes")
 
     mode = states.get_mode()
     while mode is not Mode.TERMINATED:
@@ -141,6 +153,118 @@ def run_backend(cfg, model, states, keyframes, K):
             if len(states.global_optimizer_tasks) > 0:
                 idx = states.global_optimizer_tasks.pop(0)
 
+# ========= Helper functions to load prebuilt map into SharedKeyframes =========
+def _parse_traj_txt(path):
+    # traj txt format: ts x y z qx qy qz qw
+    # returns list[dict]: {"ts": float, "t": float32[3], "q": float32[4] (wxyz)}
+    entries = []
+    with open(path, "r") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s[0] in "#%":
+                continue
+            toks = re.split(r"[,\s]+", s)
+            if len(toks) < 8:
+                continue
+            ts, x, y, z, qx, qy, qz, qw = toks[:8]
+            entries.append({
+                "ts": float(ts),
+                "t":  np.array([float(x), float(y), float(z)], dtype=np.float32),
+                "q":  np.array([float(qw), float(qx), float(qy), float(qz)], dtype=np.float32),
+            })
+    if not entries:
+        raise ValueError(f"No valid poses parsed from {path}")
+    return entries
+
+def _filename_ts(p):
+    # extract timestamp from the keyframe img filename
+    base = os.path.splitext(os.path.basename(p))[0]
+    m = re.search(r"(\d+(?:[._]\d+)?)", base)
+    if not m:
+        return None
+    return float(m.group(1).replace("_", ".").replace(",", "."))
+
+def _quat_wxyz_to_R(qwxyz):
+    w, x, y, z = qwxyz
+    n = w*w + x*x + y*y + z*z
+    if n < 1e-12: 
+        return np.eye(3, dtype=np.float32)
+    s = 2.0 / n
+    wx, wy, wz = s*w*x, s*w*y, s*w*z
+    xx, xy, xz = s*x*x, s*x*y, s*x*z
+    yy, yz, zz = s*y*y, s*y*z, s*z*z
+    R = np.array([
+        [1-(yy+zz),   xy-wz,     xz+wy],
+        [xy+wz,       1-(xx+zz), yz-wx],
+        [xz-wy,       yz+wx,     1-(xx+yy)]
+    ], dtype=np.float32)
+    return R
+
+def _pose_to_se3_tensor(t_xyz, q_wxyz, device):
+    # Convert cam2world pose to lietorch.Sim3
+    # Convert quaternion from wxyz to xyzw format for lietorch
+    q_xyzw = np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]], dtype=np.float32)
+
+    # Create Sim3 parameters: [t_x, t_y, t_z, q_x, q_y, q_z, q_w, s]
+    sim3_params = np.concatenate([t_xyz, q_xyzw, [1.0]], dtype=np.float32)
+
+    return lietorch.Sim3(torch.from_numpy(sim3_params).to(device).unsqueeze(0))
+
+def load_prebuilt_map(model, keyframes, device, cfg, prebuilt_kf_dir, prebuilt_traj_path):
+    # Rebuild keyframes (pointmaps) from saved kf imgs and traj,
+    # insert into SharedKeyframes,
+    # rebuilt retrieval database in backend
+
+    # Load trajectory entries
+    entries = _parse_traj_txt(prebuilt_traj_path)
+
+    # Collect kf imgs
+    img_paths = sorted(
+        glob.glob(os.path.join(prebuilt_kf_dir, "*.png")) +
+        glob.glob(os.path.join(prebuilt_kf_dir, "*.jpg")) +
+        glob.glob(os.path.join(prebuilt_kf_dir, "*.jpeg"))
+    )
+    if not img_paths:
+        raise FileNotFoundError(f"No images found in {prebuilt_kf_dir}")
+
+    # pair by timestamps in img filenames
+    file_ts = [_filename_ts(p) for p in img_paths]
+    use_ts  = all(ts is not None for ts in file_ts)
+
+    load = 0
+    for i, p in enumerate(img_paths):
+        bgr = cv2.imread(p, cv2.IMREAD_COLOR)
+        if bgr is None:
+            continue
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+
+        # match the corresponding pose by timestamp
+        if use_ts:
+            ts = file_ts[i]
+            jbest, dtbest = 0, 1e18
+            for j, e in enumerate(entries):
+                dt = abs(e["ts"] - ts)
+                if dt < dtbest:
+                    jbest, dtbest = j, dt
+            e = entries[jbest]
+        else:
+            # otherwise match by index order
+            j = min(i, len(entries)-1)
+            e = entries[j]
+
+        T_c2w = _pose_to_se3_tensor(e["t"], e["q"], device)
+
+        H, W = rgb.shape[:2]
+        frame = create_frame(i, rgb, T_c2w, img_size=512, device=device)
+
+        X, C = mast3r_inference_mono(model, frame)
+        frame.update_pointmap(X, C)
+
+        keyframes.append(frame)
+        load += 1
+
+    print(f"[load_prebuilt_map] Inserted {load} keyframes from {prebuilt_kf_dir}")
+
 
 if __name__ == "__main__":
     mp.set_start_method("spawn")
@@ -156,6 +280,12 @@ if __name__ == "__main__":
     parser.add_argument("--save-as", default="default")
     parser.add_argument("--no-viz", action="store_true")
     parser.add_argument("--calib", default="")
+
+    # [map_relocalize]: parse prebuilt map args
+    parser.add_argument("--prebuilt_kf_dir", default="", help="Path to saved keyframes (RGB).")
+    parser.add_argument("--prebuilt_traj", default="", help="Path to trajectory txt of the prebuilt map (ts x y z qx qy qz qw).")
+    parser.add_argument("--map_relocalize", action="store_true",
+                        help="Relocalize new frames against prebuilt map; do not add new keyframes/landmarks.")
 
     args = parser.parse_args()
 
@@ -183,7 +313,7 @@ if __name__ == "__main__":
             intrinsics["calibration"],
         )
 
-    keyframes = SharedKeyframes(manager, h, w, 64)
+    keyframes = SharedKeyframes(manager, h, w, 128)
     states = SharedStates(manager, h, w)
 
     if not args.no_viz:
@@ -218,6 +348,18 @@ if __name__ == "__main__":
             traj_file.unlink()
         if recon_file.exists():
             recon_file.unlink()
+
+    # parse args for map_relocalize mode
+    config["map_relocalize"]     = bool(args.map_relocalize)
+    config["prebuilt_kf_dir"]   = args.prebuilt_kf_dir
+    config["prebuilt_traj"]     = args.prebuilt_traj
+    # load the prebuilt map into SharedKeyframes
+    prebuilt_kf_count = 0
+    if args.prebuilt_kf_dir and args.prebuilt_traj:
+        load_prebuilt_map(model, keyframes, device, config, args.prebuilt_kf_dir, args.prebuilt_traj)
+        prebuilt_kf_count = len(keyframes)
+        print(f"[map_relocalize] Loaded {prebuilt_kf_count} memory keyframes")
+
 
     tracker = FrameTracker(model, keyframes, device)
     last_msg = WindowMsg()
@@ -263,15 +405,25 @@ if __name__ == "__main__":
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
 
         if mode == Mode.INIT:
-            # Initialize via mono inference, and encoded features neeed for database
-            X_init, C_init = mast3r_inference_mono(model, frame)
-            frame.update_pointmap(X_init, C_init)
-            keyframes.append(frame)
-            states.queue_global_optimization(len(keyframes) - 1)
-            states.set_mode(Mode.TRACKING)
-            states.set_frame(frame)
-            i += 1
-            continue
+            # [map_relocalize] init with "relocalization" mode
+            if config.get("map_relocalize", False) and len(keyframes) > 0:
+                X_init, C_init = mast3r_inference_mono(model, frame)
+                frame.update_pointmap(X_init, C_init)
+                states.set_frame(frame)
+                states.set_mode(Mode.RELOC)
+                states.queue_reloc()
+                i += 1
+                continue
+            else:
+                # Original: Initialize via mono inference, and encoded features neeed for database
+                X_init, C_init = mast3r_inference_mono(model, frame)
+                frame.update_pointmap(X_init, C_init)
+                keyframes.append(frame)
+                states.queue_global_optimization(len(keyframes) - 1)
+                states.set_mode(Mode.TRACKING)
+                states.set_frame(frame)
+                i += 1
+                continue
 
         if mode == Mode.TRACKING:
             add_new_kf, match_info, try_reloc = tracker.track(frame)
@@ -294,6 +446,10 @@ if __name__ == "__main__":
         else:
             raise Exception("Invalid mode")
 
+        if config.get("map_relocalize", False):
+            # do not add new keyframes from tracking mode
+            add_new_kf = False
+
         if add_new_kf:
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1)
@@ -311,13 +467,26 @@ if __name__ == "__main__":
 
     if dataset.save_results:
         save_dir, seq_name = eval.prepare_savedir(args, dataset)
-        eval.save_traj(save_dir, f"{seq_name}.txt", dataset.timestamps, keyframes)
-        eval.save_reconstruction(
-            save_dir,
-            f"{seq_name}.ply",
-            keyframes,
-            last_msg.C_conf_threshold,
-        )
+        eval.save_traj(save_dir, f"{seq_name}_reloc.txt", dataset.timestamps, keyframes, start_idx=prebuilt_kf_count)
+
+        # [map_relocalize] save the reconstruction with the loaded scene
+        if config.get("map_relocalize", False):
+            print(f"[map_relocalize] Saving reconstruction with {len(keyframes)} total keyframes (including prebuilt scene)")
+            # [map_relocalize] use new ply save function that preserves the loaded scene
+            eval.save_relocalize_reconstruction(
+                save_dir,
+                f"{seq_name}_reloc.ply",
+                keyframes,
+                last_msg.C_conf_threshold,
+                prebuilt_kf_count,
+            )
+        else:
+            eval.save_reconstruction(
+                save_dir,
+                f"{seq_name}.ply",
+                keyframes,
+                last_msg.C_conf_threshold,
+            )
         eval.save_keyframes(
             save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
         )

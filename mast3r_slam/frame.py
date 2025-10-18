@@ -294,7 +294,11 @@ class SharedKeyframes:
 
     def append(self, value: Frame):
         with self.lock:
-            self[self.n_size.value] = value
+            idx = self.n_size.value
+            if idx >= self.buffer:
+                raise IndexError(f"Cannot append keyframe: buffer size {self.buffer} exceeded (trying to access index {idx})")
+            self[idx] = value
+            self.n_size.value = idx + 1
 
     def pop_last(self):
         with self.lock:
