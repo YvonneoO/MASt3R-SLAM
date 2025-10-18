@@ -183,7 +183,7 @@ if __name__ == "__main__":
             intrinsics["calibration"],
         )
 
-    keyframes = SharedKeyframes(manager, h, w)
+    keyframes = SharedKeyframes(manager, h, w, 64)
     states = SharedStates(manager, h, w)
 
     if not args.no_viz:

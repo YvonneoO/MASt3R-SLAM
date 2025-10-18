@@ -40,7 +40,8 @@ class MonocularDataset(torch.utils.data.Dataset):
         return self.timestamps[idx]
 
     def read_img(self, idx):
-        img = cv2.imread(self.rgb_files[idx])
+        img = cv2.imread(str(self.rgb_files[idx]))
+        # img = cv2.imread(self.rgb_files[idx])
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     def get_image(self, idx):
@@ -112,7 +113,8 @@ class EurocDataset(MonocularDataset):
         )
 
     def read_img(self, idx):
-        img = cv2.imread(self.rgb_files[idx], cv2.IMREAD_GRAYSCALE)
+        img = cv2.imread(str(self.rgb_files[idx]), cv2.IMREAD_GRAYSCALE)
+        # img = cv2.imread(self.rgb_files[idx], cv2.IMREAD_GRAYSCALE)
         return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 
 
@@ -246,7 +248,8 @@ class MP4Dataset(MonocularDataset):
         self.stride = config["dataset"]["subsample"]
 
     def __len__(self):
-        return self.total_frames // self.stride
+        # return self.total_frames // self.stride
+        return self.total_frames - self.total_frames % self.stride
 
     def read_img(self, idx):
         if HAS_TORCHCODEC:
