@@ -25,6 +25,8 @@ from mast3r_slam.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
 import numpy as np
 import os, re, glob
+import numpy as np
+from natsort import natsorted
 
 def relocalization(frame, keyframes, factor_graph, retrieval_database):
     # we are adding and then removing from the keyframe, so we need to be careful.
@@ -219,7 +221,7 @@ def load_prebuilt_map(model, keyframes, device, cfg, prebuilt_kf_dir, prebuilt_t
     entries = _parse_traj_txt(prebuilt_traj_path)
 
     # Collect kf imgs
-    img_paths = sorted(
+    img_paths = natsorted(
         glob.glob(os.path.join(prebuilt_kf_dir, "*.png")) +
         glob.glob(os.path.join(prebuilt_kf_dir, "*.jpg")) +
         glob.glob(os.path.join(prebuilt_kf_dir, "*.jpeg"))
@@ -264,6 +266,15 @@ def load_prebuilt_map(model, keyframes, device, cfg, prebuilt_kf_dir, prebuilt_t
         load += 1
 
     print(f"[load_prebuilt_map] Inserted {load} keyframes from {prebuilt_kf_dir}")
+
+    # Return the list of timestamps and the timestamp of the last keyframe
+    if use_ts:
+        return file_ts, file_ts[-1] if file_ts else 0.0
+    elif entries:
+        # otherwise use the corresponding timestamps from the trajectory file
+        entry_ts = [e["ts"] for e in entries]
+        return entry_ts, entry_ts[-1] if entry_ts else 0.0
+    return [], 0.0
 
 
 if __name__ == "__main__":
@@ -355,9 +366,13 @@ if __name__ == "__main__":
     config["prebuilt_traj"]     = args.prebuilt_traj
     # load the prebuilt map into SharedKeyframes
     prebuilt_kf_count = 0
+    prebuilt_timestamps = []
     if args.prebuilt_kf_dir and args.prebuilt_traj:
-        load_prebuilt_map(model, keyframes, device, config, args.prebuilt_kf_dir, args.prebuilt_traj)
+        prebuilt_timestamps, last_timestamp = load_prebuilt_map(model, keyframes, device, config, args.prebuilt_kf_dir, args.prebuilt_traj)
         prebuilt_kf_count = len(keyframes)
+        if config.get("map_relocalize", False):
+            dataset.set_timestamp_offset(last_timestamp)
+            print(f"[map_relocalize] Set timestamp offset to {last_timestamp}s")
         print(f"[map_relocalize] Loaded {prebuilt_kf_count} memory keyframes")
 
 
@@ -373,6 +388,7 @@ if __name__ == "__main__":
     frames = []
 
     while True:
+        add_new_kf = False
         mode = states.get_mode()
         msg = try_get_msg(viz2main)
         last_msg = msg if msg is not None else last_msg
@@ -402,7 +418,12 @@ if __name__ == "__main__":
             if i == 0
             else states.get_frame().T_WC
         )
-        frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
+        # [map_relocalize] adjust frame_id to continue after prebuilt keyframes
+        if config.get("map_relocalize", False) and len(keyframes) > 0:
+            adjusted_frame_id = prebuilt_kf_count + i
+        else:
+            adjusted_frame_id = i
+        frame = create_frame(adjusted_frame_id, img, T_WC, img_size=dataset.img_size, device=device)
 
         if mode == Mode.INIT:
             # [map_relocalize] init with "relocalization" mode
@@ -446,9 +467,9 @@ if __name__ == "__main__":
         else:
             raise Exception("Invalid mode")
 
-        if config.get("map_relocalize", False):
-            # do not add new keyframes from tracking mode
-            add_new_kf = False
+        # if config.get("map_relocalize", False):
+        #     # do not add new keyframes from tracking mode
+        #     add_new_kf = False
 
         if add_new_kf:
             keyframes.append(frame)
@@ -467,7 +488,7 @@ if __name__ == "__main__":
 
     if dataset.save_results:
         save_dir, seq_name = eval.prepare_savedir(args, dataset)
-        eval.save_traj(save_dir, f"{seq_name}_reloc.txt", dataset.timestamps, keyframes, start_idx=prebuilt_kf_count)
+        eval.save_traj(save_dir, f"{seq_name}_tsOffset.txt", dataset.timestamps, keyframes, start_idx=prebuilt_kf_count)
 
         # [map_relocalize] save the reconstruction with the loaded scene
         if config.get("map_relocalize", False):
@@ -475,7 +496,7 @@ if __name__ == "__main__":
             # [map_relocalize] use new ply save function that preserves the loaded scene
             eval.save_relocalize_reconstruction(
                 save_dir,
-                f"{seq_name}_reloc.ply",
+                f"{seq_name}_tsOffset.ply",
                 keyframes,
                 last_msg.C_conf_threshold,
                 prebuilt_kf_count,
@@ -487,9 +508,18 @@ if __name__ == "__main__":
                 keyframes,
                 last_msg.C_conf_threshold,
             )
-        eval.save_keyframes(
-            save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
-        )
+
+        if config.get("map_relocalize", False):
+            # loaded kf imgs: 0-original timestamp
+            # new kf imgs: 1-new timestamp
+            eval.save_relocalize_keyframes(
+                save_dir / "keyframes" / seq_name, prebuilt_timestamps, dataset.timestamps, keyframes, prebuilt_kf_count
+            )
+        else:
+            # original
+            eval.save_keyframes(
+                save_dir / "keyframes" / seq_name, dataset.timestamps, keyframes
+            )
     if save_frames:
         savedir = pathlib.Path(f"logs/frames/{datetime_now}")
         savedir.mkdir(exist_ok=True, parents=True)

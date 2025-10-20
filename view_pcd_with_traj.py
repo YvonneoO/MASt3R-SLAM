@@ -9,13 +9,16 @@ import signal
 from pathlib import Path
 import numpy as np
 import open3d as o3d
-
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+import matplotlib.patches as patches
+from matplotlib.colors import LinearSegmentedColormap
 
 # ========= INPUT PATHS =========
-PLY_PATH  = "logs/Navigation_reloc.ply"
-TRAJ_PATH = "logs/Navigation_reloc.txt"
+PLY_PATH  = "logs/Navigation_tsOffset.ply"
+TRAJ_PATH = "logs/Navigation_tsOffset.txt"
 
-# ========= VIS PARAMS =========
+# ========= Open3D Visualization PARAMS =========
 IMG_W, IMG_H = 640, 480     # only used to shape the frustum
 HFOV_DEG     = 90.0         # horizontal field-of-view (deg) for frustum shape
 FRUSTUM_DEPTH = 0.5         # frustum length in scene units (e.g., meters)
@@ -23,6 +26,15 @@ DRAW_EVERY    = 1           # draw every Nth pose
 FRUSTUM_COLOR = (0.9, 0.3, 0.1)
 TRAJ_COLOR    = (0.0, 1.0, 0.0)
 WORLD_AXIS_SIZE = 0.3
+
+# --- BEV Visualization params ---
+DRAW_EVERY    = 1       # keep in sync with Open3D frusta
+ZOOM_TO       = "traj"  # "traj" | "cloud" | "both"
+ZOOM_MARGIN_M = 1.0     # meters of padding around the chosen bounds
+ARROW_SCALE_M = 0.25    # arrow length in meters (BEV units)
+ARROW_WIDTH   = 2.0     # arrow line width (px)
+TRAJ_WIDTH    = 2.0     # trajectory line width (px)
+POSE_SKIP     = DRAW_EVERY  # stride for arrows, keep equal to DRAW_EVERY
 
 # ========= GLOBAL TRANSFORM =========
 # Apply a global SE(3):  X' = Rg * X + tg
@@ -41,7 +53,16 @@ RB_CUSTOM    = np.eye(3)    # used if BEV_ROT_AXIS == "custom"
 
 # ========= CROP (in BEV frame) =========
 # Remove the top X cm after BEV transform.
-CROP_TOP_CM = 135.0
+CROP_TOP_CM = 140.0
+
+# ========= BEV 2D GENERATION =========
+GENERATE_BEV_IMAGE = True         # Set to True to generate 2D BEV image
+BEV_IMAGE_SIZE = (1024, 512)     # (width, height) in pixels
+BEV_RESOLUTION = 0.01             # meters per pixel
+BEV_SAVE_PATH = "logs/Navigation_tsOffset_bev.png"  # Output path for BEV image
+BEV_POINT_SIZE = 0.5              # Size of points in BEV (pixels)
+BEV_TRAJ_WIDTH = 2.0              # Width of trajectory line (pixels)
+
 
 def rodrigues(axis, deg):
     th = np.deg2rad(deg)
@@ -183,6 +204,148 @@ def crop_top_along_z(points, colors, crop_cm):
         colors = colors[keep]
     return points, colors
 
+# --- helper: forward directions for each pose in WORLD, then apply combined transform
+def _world_to_pixel_builder(all_xy, image_size):
+    """Builds a world->pixel mapping that fits all_xy into image_size."""
+    min_x, min_y = np.min(all_xy, axis=0)
+    max_x, max_y = np.max(all_xy, axis=0)
+
+    padding = 0.5  # meters
+    min_x -= padding; min_y -= padding
+    max_x += padding; max_y += padding
+
+    world_w = max_x - min_x
+    world_h = max_y - min_y
+
+    sx = image_size[0] / max(world_w, 1e-6)
+    sy = image_size[1] / max(world_h, 1e-6)
+    scale = min(sx, sy)
+
+    cx = 0.5 * (min_x + max_x)
+    cy = 0.5 * (min_y + max_y)
+
+    def world_to_pixel(xy):
+        x, y = xy
+        px = (x - cx) * scale + image_size[0] * 0.5
+        py = (y - cy) * scale + image_size[1] * 0.5
+        return px, py
+
+    return world_to_pixel, scale
+
+
+def project_to_bev_2d(points, colors, poses, quats_wxyz, Rtot, ttot, image_size):
+    """
+    Project 3D points and trajectory to 2D BEV.
+    - points: Nx3 point cloud (already in world)
+    - poses:  Mx3 camera centers (world)
+    - quats_wxyz: Mx4 (w,x,y,z) camera-to-world rotations
+    - Rtot, ttot: combined transform (same as Open3D)
+    - image_size: (W,H) pixels
+    Returns: dict with pixel coords, mapping, and scale
+    """
+    # Apply same transform used in Open3D
+    P = (Rtot @ points.T).T + ttot
+    C = (Rtot @ poses.T).T + ttot
+
+    # BEV convention: (x, -z)
+    P_xy = np.column_stack((P[:, 0], -P[:, 2]))
+    C_xy = np.column_stack((C[:, 0], -C[:, 2]))
+
+    # Map everything into the image canvas
+    all_xy = P_xy if len(C_xy) == 0 else np.vstack([P_xy, C_xy])
+    world_to_pixel, scale = _world_to_pixel_builder(all_xy, image_size)
+
+    # Convert to pixels
+    P_px = np.array([world_to_pixel(xy) for xy in P_xy])
+    C_px = np.array([world_to_pixel(xy) for xy in C_xy])
+
+    # Prepare per-pose heading (2D) after the same transform
+    fwd_px = []
+    for q in quats_wxyz:
+        R_c2w = quat_wxyz_to_R(q)
+        fwd_world = Rtot @ (R_c2w @ np.array([0.0, 0.0, 1.0]))
+        # BEV 2D direction with the convention (x, -z)
+        d2 = np.array([fwd_world[0], -fwd_world[2]], float)
+        n = np.linalg.norm(d2) + 1e-12
+        fwd_px.append(d2 / n)
+    fwd_px = np.asarray(fwd_px)
+
+    return {
+        "pts_px": P_px,
+        "centers_px": C_px,
+        "colors": colors,
+        "fwd_px_dir": fwd_px,
+        "world_to_pixel": world_to_pixel,
+        "scale_px_per_m": scale
+    }
+
+
+def generate_bev_image(points, colors, poses, quats_wxyz, Rtot, ttot, save_path):
+    """Generate/save BEV with ALL poses (green line) and per-pose heading arrows."""
+    print(f"[INFO] Generating BEV image")
+
+    proj = project_to_bev_2d(
+        points, colors, poses, quats_wxyz, Rtot, ttot, BEV_IMAGE_SIZE
+    )
+
+    pts_px      = proj["pts_px"]
+    centers_px  = proj["centers_px"]
+    point_cols  = proj["colors"]
+    fwd_px_dir  = proj["fwd_px_dir"]
+    scale       = proj["scale_px_per_m"]
+
+    # --- Figure ---
+    fig_w = max(10, BEV_IMAGE_SIZE[0] / 100)   # rough figsize heuristic
+    fig_h = max(6,  BEV_IMAGE_SIZE[1] / 100)
+    fig, ax = plt.subplots(1, 1, figsize=(fig_w, fig_h))
+
+    ax.set_xlim(0, BEV_IMAGE_SIZE[0])
+    ax.set_ylim(0, BEV_IMAGE_SIZE[1])
+    ax.set_aspect('equal')
+
+    # Plot cloud
+    if len(pts_px) > 0:
+        if point_cols is not None:
+            if point_cols.max() > 1.0:  # keep the original colors
+                point_cols = point_cols / 255.0
+            ax.scatter(pts_px[:, 0], pts_px[:, 1],
+                       c=point_cols, s=BEV_POINT_SIZE, alpha=0.7, edgecolors='none')
+        else:
+            ax.scatter(pts_px[:, 0], pts_px[:, 1],
+                       c='tab:blue', s=BEV_POINT_SIZE, alpha=0.6, edgecolors='none')
+
+    # Plot trajectory
+    if len(centers_px) > 1:
+        ax.plot(centers_px[:, 0], centers_px[:, 1],
+                color='tab:green', linewidth=2.0, alpha=0.9, label='Trajectory')
+
+    # Pose arrows with heading
+    arrow_len_px = max(12.0, 0.35 * scale)
+    for c, d in zip(centers_px, fwd_px_dir):
+        ax.arrow(c[0], c[1], d[0]*arrow_len_px, d[1]*arrow_len_px,
+                 width=2.0, head_width=10.0, head_length=12.0,
+                 length_includes_head=True, color='red', alpha=0.9)
+
+    # Create custom legend elements
+    legend_elements = [
+        Line2D([0], [0], color='tab:green', linewidth=2.0, label='Trajectory'),
+        Line2D([0], [0], marker='>', color='red', markerfacecolor='red', 
+               markersize=12, label='Camera Pose', linestyle='None', markeredgecolor='red')
+    ]
+    ax.legend(handles=legend_elements, loc='upper right', framealpha=0.9)
+
+    # ax.grid(True, alpha=0.25)
+    ax.set_title("Navigation_tsOffset - Scene & Trajectory")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight', facecolor='white')
+    plt.close()
+
+    print(f"[INFO] BEV image saved to: {save_path}")
+    print(f"[INFO] Scale: {scale:.2f} px/m, points: {len(pts_px)}, poses: {len(centers_px)}")
+
 def signal_handler(sig, frame):
     # Ctrl+C / Exit
     print("\n[INFO] Interrupted by user. Closing window...")
@@ -224,7 +387,12 @@ def main():
 
     # Load trajectory
     poses, quats_wxyz = read_trajectory(str(traj_path))
+    poses_T = (Rtot @ poses.T).T + ttot
     print(f"[INFO] poses loaded: {len(poses)} (drawing every {DRAW_EVERY})")
+
+    # Generate BEV image if requested
+    if GENERATE_BEV_IMAGE:
+        generate_bev_image(points, colors, poses_T, quats_wxyz, Rtot, ttot, BEV_SAVE_PATH)
 
     # Build frusta and trajectory (both get combined transform)
     fx, fy, cx, cy = synthetic_intrinsics_from_hfov(IMG_W, IMG_H, HFOV_DEG)
@@ -244,7 +412,7 @@ def main():
 
     print("[INFO] Start rendering… (press Esc to exit)")
     try:
-        o3d.visualization.draw_geometries(geoms, window_name="Point Cloud + Trajectory (Navigation reloc)")
+        o3d.visualization.draw_geometries(geoms, window_name="Point Cloud + Trajectory (Navigation_tsOffset)")
     except KeyboardInterrupt:
         print("\n[INFO] Window closed by keyboard interrupt.")
         sys.exit(0)

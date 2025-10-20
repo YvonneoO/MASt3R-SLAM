@@ -26,6 +26,7 @@ class MonocularDataset(torch.utils.data.Dataset):
         self.camera_intrinsics = None
         self.use_calibration = config["use_calib"]
         self.save_results = True
+        self.timestamp_offset = 0.0  # Add timestamp offset
 
     def __len__(self):
         return len(self.rgb_files)
@@ -37,7 +38,7 @@ class MonocularDataset(torch.utils.data.Dataset):
         return timestamp, img
 
     def get_timestamp(self, idx):
-        return self.timestamps[idx]
+        return self.timestamps[idx] + self.timestamp_offset
 
     def read_img(self, idx):
         img = cv2.imread(str(self.rgb_files[idx]))
@@ -63,6 +64,10 @@ class MonocularDataset(torch.utils.data.Dataset):
 
     def has_calib(self):
         return self.camera_intrinsics is not None
+    
+    def set_timestamp_offset(self, offset):
+        # Set timestamp offset for continuous timestamps across multi-sessions
+        self.timestamp_offset = offset
 
 
 class TUMDataset(MonocularDataset):
@@ -190,7 +195,7 @@ class RealsenseDataset(MonocularDataset):
         return 999999
 
     def get_timestamp(self, idx):
-        return self.timestamps[idx]
+        return self.timestamps[idx] + self.timestamp_offset
 
     def read_img(self, idx):
         frameset = self.pipeline.wait_for_frames()
@@ -218,7 +223,7 @@ class Webcam(MonocularDataset):
         return 999999
 
     def get_timestamp(self, idx):
-        return self.timestamps[idx]
+        return self.timestamps[idx] + self.timestamp_offset
 
     def read_img(self, idx):
         ret, img = self.cap.read()

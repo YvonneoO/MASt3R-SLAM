@@ -123,6 +123,29 @@ def save_keyframes(savedir, timestamps, keyframes: SharedKeyframes):
             ),
         )
 
+def save_relocalize_keyframes(savedir, prebuilt_timestamps, new_video_timestamps, keyframes: SharedKeyframes, start_idx):
+    savedir = pathlib.Path(savedir)
+    savedir.mkdir(exist_ok=True, parents=True)
+    for i in range(len(keyframes)):
+        keyframe = keyframes[i]
+        if i < start_idx:
+            # Pre-built keyframe
+            t = prebuilt_timestamps[i]
+            filename = savedir / f"0-{t}.png"
+        else:
+            # New keyframe
+            frame_id_in_new_video = keyframe.frame_id - start_idx
+            t = new_video_timestamps[frame_id_in_new_video]
+            filename = savedir / f"1-{t}.png"
+
+        cv2.imwrite(
+            str(filename),
+            cv2.cvtColor(
+                (keyframe.uimg.cpu().numpy() * 255).astype(np.uint8), cv2.COLOR_RGB2BGR
+            ),
+        )
+
+
 
 def save_ply(filename, points, colors):
     colors = colors.astype(np.uint8)
